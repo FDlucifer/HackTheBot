@@ -1,6 +1,8 @@
 # HackTheBot
 
-/!\ In construction /!\\\
+⚠️ **You shouldn't use this bot anymore. The code is old and dirty, HTB changed their interface (even the old with small details) so the scraping don't work anymore, and they released a working API, which you should rely on. So I'll archive this repo.** ⚠️
+
+
 You can see the progress here : https://trello.com/b/Y8Ah3ZPY/hackthebot
 
 The bot is almost ready to be used!
