@@ -1,9 +1,10 @@
 from os import path
+import config as cfg
 import httpx
 import trio
 import re
 import json
-from time import localtime, gmtime, strftime
+from time import localtime, gmtime, strftime, sleep
 import discord
 from copy import deepcopy
 from scrapy.selector import Selector
@@ -11,19 +12,52 @@ import config as cfg
 import resources.charts as charts
 import urllib
 import pdb
+import requests
+from lib.api import HTBApi
 
 class HTBot():
-    def __init__(self, email, password, api_token=""):
-        self.email = email
-        self.password = password
-        self.api_token = api_token
-
-        self.is_vip = False
-
+    def __init__(self):
+        # for API v3 (obsolete - to remove when all endpoints are migrated)
+        self.email = cfg.HTB['email']
+        self.password = cfg.HTB['password']
+        self.api_token = cfg.HTB['api_token']
+        self.htb_url = cfg.HTB['htb_url']
+        self.api_url_v3 = cfg.HTB['api_url_v3']
         self.headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/40.0.2214.85 Safari/537.36"
+            "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:86.0) Gecko/20100101 Firefox/86.0"
         }
-        self.session = httpx.AsyncClient(headers=self.headers, timeout=360.0)
+        self.payload = {'api_token': self.api_token}
+        self.session = httpx.AsyncClient(headers=self.headers, timeout=10.0)
+        self.session_requests = requests.Session()
+        self.session_requests.headers.update(self.headers)
+        # proxy via requests
+        proxies = {
+            'http': 'http://127.0.0.1:8080',
+            'https': 'http://127.0.0.1:8080',
+        }
+        self.proxy_session = httpx.AsyncClient(headers=self.headers, timeout=10.0, proxies=proxies)
+        self.proxy_session_requests = requests.Session()
+        self.proxy_session_requests.headers.update(self.headers)
+        self.proxy_session_requests.proxies.update(proxies)
+        self.proxy_session_requests.verify = False
+        self.regexs = {
+            "box_pwn": "(?:.*)profile\/(\d+)\">(?:.*)<\/a> owned (.*) on <a(?:.*)profile\/(?:\d+)\">(.*)<\/a> <a(?:.*)",
+            "chall_pwn": "(?:.*)profile\/(\d+)\">(?:.*)<\/a> solved challenge <(?:.*)>(.*)<(?:.*)><(?:.*)> from <(?:.*)>(.*)<(?:.*)><(?:.*)",
+            "new_box_incoming": "(?:.*)Get ready to spill some (?:.* blood .*! <.*>)(.*)<(?:.* available in <.*>)(.*)<(?:.*)><(?:.*)",
+            "new_box_out": "(?:.*)>(.*)<(?:.*) is mass-powering on! (?:.*)",
+            "vip_upgrade": "(?:.*)profile\/(\d+)\">(?:.*)<\/a> became a <(?:.*)><(?:.*)><(?:.*)> V.I.P <(?:.*)",
+            "writeup_links": "Submitted By: <a href=(?:.*?)>(.*?)<(?:.*?)Url: (?:.*?)href=\"(.*?)\"",
+#            "check_vip": "(?:.*)Plan\: <span class=\"c-white\">(\w*)<(?:.*)",
+            "check_vip": "(?:.*)Plan\: <span class=\"c-white\">([A-Z]+)",
+            "owns": "owned (challenge|user|root|) <(?:.*?)>(?: |)<(?:.*?)>(?: |)(.*?)(?: |)<",
+            "chall": "panel-tools\"> (\d*\/\d*\/\d*) (?:.*?)\"text-(success|warning|danger)\">(?:.*?)(?:\[(\d*?) Points\]|) <\/span> (.*?) \[by <(?:.*?)>(.*?)<\/a>\](?:.*?)\[(\d*?) solvers\](?:.*?)challenge=\"(.*?)\" data-toggle=(?:.*?)Rate Pro\">(\d*?) <(?:.*?)Rate Sucks\">(\d*?) <(?:.*?)> First Blood: <(?:.*?)>(.*?)<(?:.*?)><\/span><br><br>(.*?)<br> <br> (?:<p|<\/div)",
+            "chall_diff": "diffchart(\d*)\"\)\.sparkline\((\[.*?\])",
+            "chall_status": "<h3>(Active|Retired) \((?:\d*?)\)<\/h3>"
+        }
+        
+        # for API v4
+        self.api_v4 = HTBApi()
+        self.is_vip = False
         self.locks = {
                 "notif": trio.Lock(),
                 "write_users": trio.Lock(),
@@ -34,21 +68,7 @@ class HTBot():
                 "refresh_challs": trio.Lock()
                 }
 
-        self.payload = {'api_token': self.api_token}
         self.last_checked = []
-        self.regexs = {
-            "box_pwn": "(?:.*)profile\/(\d+)\">(?:.*)<\/a> owned (.*) on <a(?:.*)profile\/(?:\d+)\">(.*)<\/a> <a(?:.*)",
-            "chall_pwn": "(?:.*)profile\/(\d+)\">(?:.*)<\/a> solved challenge <(?:.*)>(.*)<(?:.*)><(?:.*)> from <(?:.*)>(.*)<(?:.*)><(?:.*)",
-            "new_box_incoming": "(?:.*)Get ready to spill some (?:.* blood .*! <.*>)(.*)<(?:.* available in <.*>)(.*)<(?:.*)><(?:.*)",
-            "new_box_out": "(?:.*)>(.*)<(?:.*) is mass-powering on! (?:.*)",
-            "vip_upgrade": "(?:.*)profile\/(\d+)\">(?:.*)<\/a> became a <(?:.*)><(?:.*)><(?:.*)> V.I.P <(?:.*)",
-            "writeup_links": "Submitted By: <a href=(?:.*?)>(.*?)<(?:.*?)Url: (?:.*?)href=\"(.*?)\"",
-            "check_vip": "(?:.*)Plan\: <span class=\"c-white\">(\w*)<(?:.*)",
-            "owns": "owned (challenge|user|root|) <(?:.*?)>(?: |)<(?:.*?)>(?: |)(.*?)(?: |)<",
-            "chall": "panel-tools\"> (\d*\/\d*\/\d*) (?:.*?)\"text-(success|warning|danger)\">(?:.*?)(?:\[(\d*?) Points\]|) <\/span> (.*?) \[by <(?:.*?)>(.*?)<\/a>\](?:.*?)\[(\d*?) solvers\](?:.*?)challenge=\"(.*?)\" data-toggle=(?:.*?)Rate Pro\">(\d*?) <(?:.*?)Rate Sucks\">(\d*?) <(?:.*?)> First Blood: <(?:.*?)>(.*?)<(?:.*?)><\/span><br><br>(.*?)<br> <br> (?:<p|<\/div)",
-            "chall_diff": "diffchart(\d*)\"\)\.sparkline\((\[.*?\])",
-            "chall_status": "<h3>(Active|Retired) \((?:\d*?)\)<\/h3>"
-        }
         self.notif = {
             "update_role": {
                 "state": False,
@@ -96,6 +116,7 @@ class HTBot():
                 }
             }
         }
+
         if path.exists("users.txt"):
             with open("users.txt", "r") as f:
                 self.users = json.loads(f.read())
@@ -156,7 +177,7 @@ class HTBot():
 
 
     async def login(self):
-        req = await self.session.get("https://www.hackthebox.eu/login")
+        req = await self.session.get(self.htb_url + "/login")
 
         html = req.text
         csrf_token = re.findall(r'type="hidden" name="_token" value="(.+?)"', html)
@@ -170,7 +191,7 @@ class HTBot():
             "password": self.password
         }
 
-        req = await self.session.post('https://www.hackthebox.eu/login', data=data)
+        req = await self.session.post(self.htb_url + "/login", data=data)
 
         if req.status_code == 200:
             print("Connecté à HTB !")
@@ -183,11 +204,11 @@ class HTBot():
     async def refresh_boxs(self):
         print("Rafraichissement des boxs...")
 
-        req = await self.session.get("https://www.hackthebox.eu/api/machines/get/all/", params=self.payload, headers=self.headers)
+        req = await self.session.get(self.api_url_v3 + "/machines/get/all/", params=self.payload, headers=self.headers)
 
         if req.status_code == 200:
             new_boxs = json.loads(req.text)
-            _req = await self.session.get("https://www.hackthebox.eu/api/machines/difficulty?api_token=" + self.api_token, headers=self.headers)
+            _req = await self.session.get(self.api_url_v3 + "/machines/difficulty?api_token=" + self.api_token, headers=self.headers)
 
             # Get difficulty ratings
             if req.status_code == 200:
@@ -224,7 +245,7 @@ class HTBot():
                 return False
 
         if matrix:
-            req = await self.session.get("https://www.hackthebox.eu/api/machines/get/matrix/" + str(box["id"]), params=self.payload, headers=self.headers)
+            req = await self.session.get(self.api_url_v3 + "/machines/get/matrix/" + str(box["id"]), params=self.payload, headers=self.headers)
             if req.status_code == 200:
                 matrix_data = json.loads(req.text)
             else:
@@ -233,7 +254,7 @@ class HTBot():
             matrix_url = urllib.parse.quote_plus(charts.templates["matrix"].format(matrix_data["aggregate"], matrix_data["maker"]), safe=';/?:@&=+$,').replace('+', '%20').replace('%0A', '\\n')
 
 
-        embed = discord.Embed(title=box["name"], color=0x9acc14, url="https://www.hackthebox.eu/home/machines/profile/" + str(box["id"]))
+        embed = discord.Embed(title=box["name"], color=0x9acc14, url=self.htb_url + "/home/machines/profile/" + str(box["id"]))
         embed.set_thumbnail(url=box["avatar_thumb"])
         embed.add_field(name="IP", value=str(box["ip"]))
         if box["os"].lower() == "windows":
@@ -294,7 +315,7 @@ class HTBot():
 
 
     async def verify_user(self, discord_id, htb_acc_id):
-        req = await self.session.get("https://www.hackthebox.eu/api/users/identifier/" + htb_acc_id, headers=self.headers)
+        req = self.session_requests.get(self.api_url_v3 + "/users/identifier/" + htb_acc_id, headers=self.headers)
 
         if req.status_code == 200:
             users = self.users
@@ -341,7 +362,7 @@ class HTBot():
             'api_token': self.api_token
         }
 
-        req = await self.session.post("https://www.hackthebox.eu/api/user/id", params=params, headers=self.headers)
+        req = self.session_requests.post(self.api_url_v3 + "/user/id", params=params, headers=self.headers)
 
         try:
             user = json.loads(req.text)
@@ -352,6 +373,13 @@ class HTBot():
 
     async def get_user(self, htb_id):
         results = await self.extract_user_info(htb_id)
+        if not results:
+            embed = discord.Embed(color=0x9acc14)
+            embed.add_field(name="This profile is private, it must be set to **Public** to be viewed", value="You must set it !")
+            embed.set_image(url="https://i.imgur.com/8DKNvEk.png")
+            
+            return embed
+
         infos = results["infos"]
 
         if infos["vip"]:
@@ -371,42 +399,45 @@ class HTBot():
         return embed
 
 
+    def get_chall_categories(self, simple=False):
+        categories = self.api_v4.challenge_categories()
+        if categories is False:
+            return False
+
+        formatted_categories = {}
+        formatted_categories_simple = []
+        for category in categories['info']:
+            if simple:
+                formatted_categories_simple.append(category['name'])
+            else:
+                id = int(category['id'])
+                formatted_categories[id] = category['name']
+
+        if simple:
+            return formatted_categories_simple
+        else:
+            return formatted_categories
+
+
     async def refresh_all_challs(self):
-        print("Rafraichissement des challenges...")
-        categories = ["Reversing", "Crypto", "Stego", "Pwn", "Web", "Misc", "Forensics", "Mobile", "OSINT"]
-
+        print("Challenges refresh...")
+        categories = self.get_chall_categories()
+        
         async with trio.open_nursery() as nursery:
-            for category in categories:
-                nursery.start_soon(self.refresh_chall, category)
+            nursery.start_soon(self.refresh_chall, categories)
 
-        print("Les challenges ont été mis à jour !")
+        print("Challenges updated !")
 
-    async def refresh_chall(self, category):
-        new_challs = await self.extract_challs(category)
+    async def refresh_chall(self, categories):
+        new_challs = await self.extract_challs(categories)
         if not new_challs:
-            print("Erreur lors du refresh des challenges de la catégorie {}.".format(category))
+            print("!! Challenge refresh error")
             return False
 
         async with self.locks["refresh_challs"]:
             challs = self.challs
 
             if challs:
-                # Check if a chall is removed (yes, it happens)
-                old_chall_ids = [chall["id"] for chall in challs if chall["category"].lower() == category.lower()]
-                for chall in new_challs:
-                    if chall["id"] in old_chall_ids:
-                        old_chall_ids.remove(chall["id"])
-
-                if old_chall_ids: # If there's still one
-                    for old_chall_id in old_chall_ids:
-                        count = 0
-                        for chall in challs:
-                            if chall["id"] == old_chall_id:
-                                print("Un chall a été retiré !")
-                                del(challs[count])
-                                break
-                            count += 1
-
                 count = 0
                 for chall in challs:
                     new_count = 0
@@ -420,7 +451,7 @@ class HTBot():
                 # If there's still a chall in the list, we can send a notif that a new chall got released
                 if new_challs:
                     for chall in new_challs:
-                        print("Nouveau chall détecté !")
+                        print("New challenge detected !")
                         self.challs.append(chall)
 
                 challs = sorted(challs, key = lambda i: int(i['id']))
@@ -429,93 +460,47 @@ class HTBot():
                 return True
 
             else:
-                print("Rafraichissement initial des challenges !")
+                print("Initial challenges refresh !")
                 await self.write_challs(new_challs)
                 return True
 
 
-    async def extract_challs(self, category):
-
-        async def extract_challs_difficulty(html):
-            challs = html.css('script').getall()[-1]
-            results = re.compile(self.regexs["chall_diff"]).findall(challs)
-            diff_list = []
-
-            if results:
-                for result in results:
-                    diff_ratings = json.loads(result[1].replace(", ]", " ]"))
-                    diff_list.append({"id": int(result[0]), "diff": diff_ratings})
-
-                return diff_list
-
-            return False
-
-        req = await self.session.get("https://www.hackthebox.eu/home/challenges/" + category, headers=self.headers)
-        if req.status_code == 200:
-            body = req.text
-            html = Selector(text=body)
+    async def extract_challs(self, categories):
+        response = self.api_v4.challenges_list()
+        if response is not False:
             new_challs = []
-            diff_list = await extract_challs_difficulty(html)
-            if not diff_list:
-                return False
+            for challenge in response['challenges']:
+                # too slow
+                #challenge_details = self.api_v4.challenge_info(challenge['id'])
+                #if challenge_details is False:
+                #    continue
+                
+                # too slow
+                #challenge_details = challenge_details["challenge"]
 
-            status_flag = None
-            parts = html.css('section.content > div.container-fluid > *').getall()
-            #infos = []
-            for part in parts:
-                status = re.compile(self.regexs["chall_status"]).findall(part)
-                #print(status)
-                if status:
-                    status_flag = status[0]
+                category = categories[challenge['challenge_category_id']]
+                if not category:
+                    category = 'None'
 
-                if status_flag:
-                    part = part.replace("\n", "")
-                    results = re.compile(self.regexs["chall"]).findall(part)
-                    if results:
-                        data = results[0]
-
-                        id = int(data[6])
-                        for chall in diff_list:
-                            if chall["id"] == id:
-                                diff_ratings = chall["diff"]
-
-                        if data[1] == "success":
-                            difficulty = "Easy"
-                        elif data[1] == "warning":
-                            difficulty = "Medium"
-                        elif data[1] == "danger":
-                            difficulty = "Hard"
-                        else:
-                            print("Erreur : difficulté inconnue.")
-                            return False
-
-                        if data[2]:
-                            points = int(data[2])
-                        else:
-                            points = 0
-
-                        description = data[10].replace("â€™", "'").replace("<br>", "\n").replace("</p><p>", "\n").replace("<p>", "").replace("</p>", "").strip()
-
-                        new_chall = {
-                            "id": id,
-                            "name": data[3],
-                            "category": category,
-                            "difficulty": difficulty,
-                            "points": points,
-                            "owns": int(data[5]),
-                            "rates": {
-                                "pro": int(data[7]),
-                                "sucks": int(data[8]),
-                                "difficulty": diff_ratings
-                            },
-                            "release": data[0],
-                            "status": status_flag,
-                            "maker": data[4],
-                            "blood": data[9],
-                            "description": description
-                        }
-
-                        new_challs.append(new_chall)
+                new_chall = {
+                    "id": challenge['id'],
+                    "name": challenge['name'],
+                    "category": category,
+                    "difficulty": challenge['difficulty'],
+                    "points": challenge['points'],
+                    "owns": int(challenge['solves']),
+                    "rates": {
+                        "pro": int(challenge['likes']),
+                        "sucks": int(challenge['dislikes']),
+                        "difficulty": int(challenge["avg_difficulty"])
+                    },
+                    "release": challenge['release_date'],
+                    "status": challenge['isActive'],
+                    "maker": "",
+                    "blood": "",
+                    "description": ""
+                }
+                new_challs.append(new_chall)
 
             return new_challs
 
@@ -523,14 +508,14 @@ class HTBot():
 
 
     async def refresh_all_users(self):
-        print("Rafraichissement des users...")
+        print("Users refresh...")
         users = self.users
 
         async with trio.open_nursery() as nursery:
             for user in users:
                 nursery.start_soon(self.refresh_user, user["htb_id"])
 
-        print("Les users ont été mis à jour !")
+        print("Users updated !")
 
 
     async def refresh_user(self, htb_id, new=False):
@@ -630,46 +615,45 @@ class HTBot():
 
     async def extract_user_info(self, htb_id):
         infos = {}
-        req = await self.session.get("https://www.hackthebox.eu/home/users/profile/" + str(htb_id), headers=self.headers)
+        profile_response = self.api_v4.profile(htb_id)
+        activity_response = self.api_v4.profile_activity(htb_id)
+        challenge_response = self.api_v4.profile_progress_challenges(htb_id)
 
-        if req.status_code == 200:
-            body = req.text
-            html = Selector(text=body)
+        if profile_response is False:
+            return False
+
+        if profile_response is not False and activity_response is not False and challenge_response is not False:
+            profile = profile_response["profile"]
+            activity = activity_response["profile"]["activity"]
+            challenges = challenge_response["profile"]
 
             # User infos
-            infos["username"] = html.css('div.header-title > h3::text').get().strip()
-            infos["avatar"] = html.css('div.header-icon > img::attr(src)').get()
-            infos["points"] = html.css('div.header-title > small > span[title=Points]::text').get().strip()
-            infos["systems"] = html.css('div.header-title > small > span[title="Owned Systems"]::text').get().strip()
-            infos["users"] = html.css('div.header-title > small > span[title="Owned Users"]::text').get().strip()
-            infos["respect"] = html.css('div.header-title > small > span[title=Respect]::text').get().strip()
-            infos["country"] = Selector(text=html.css('div.header-title > small > span').getall()[4]).css('span::attr(title)').get().strip()
-            infos["level"] = html.css('div.header-title > small > span::text').extract()[-1].strip()
-            infos["rank"] = re.search(r'position (\d+) of the Hall of Fame', body).group(1)
-            infos["challs"] = re.search(r'has solved (\d+) challenges', body).group(1)
-            infos["ownership"] = html.css('div.progress-bar-success > span::text').get()
-            if html.css('div.header-title > h3 > i.fa-star'):
-                infos["vip"] = True
-            else:
-                infos["vip"] = False
+            infos["username"] = profile['name']
+            infos["avatar"] = self.htb_url + "/" + profile['avatar']
+            infos["points"] = profile['points']
+            infos["systems"] = profile['system_owns']
+            infos["users"] = profile['user_owns']
+            infos["respect"] = profile['respects']
+            infos["country"] = profile['country_name']
+            infos["level"] = profile['rank']
+            infos["rank"] = profile['rank']
+            infos["challs"] = challenges['challenge_owns']['solved']
+            infos["ownership"] = profile['rank_ownership']
+            infos["vip"] = True
+#            if html.css('div.header-title > h3 > i.fa-star'):
+#                infos["vip"] = True
+#            else:
+#                infos["vip"] = False
 
-            if html.css('div.header-title > small > i.fa-users'):
-                infos["team"] = html.css('div.header-title > small > a::text').get()
-            else:
-                infos["team"] = False
+            infos["team"] = profile['team']
 
             # User owns
-            owns = html.css('div.v-timeline').get()
-            results = re.compile(self.regexs["owns"]).findall(owns)
-
             temp_owns = []
-
-            if results:
-                for own in results:
-                    if own[0].lower() == "user" or own[0].lower() == "root":
-                        temp_owns.append({"type": "box", "level": own[0], "name": own[1].capitalize()})
-                    elif own[0].lower() == "challenge":
-                        temp_owns.append({"type": "challenge", "level": None, "name": own[1].capitalize()})
+            for own in activity:
+                if own["type"] == "user" or own["type"] == "root":
+                    temp_owns.append({"type": "box", "level": own["type"], "name": own["name"]})
+                elif own["type"] == "challenge":
+                    temp_owns.append({"type": "challenge", "level": None, "name": own["name"]})
 
             return {"infos": infos, "owns": temp_owns}
 
@@ -730,7 +714,7 @@ class HTBot():
             self.notif["vip_upgrade"]["content"]["discord_id"] = user["discord_id"]
             self.notif["vip_upgrade"]["state"] = True
 
-        req = await self.session.post("https://www.hackthebox.eu/api/shouts/get/initial/html/30?api_token=" + self.api_token, headers=self.headers)
+        req = await self.session.post(self.api_url_v3 + "/shouts/get/initial/html/30?api_token=" + self.api_token, headers=self.headers)
 
         if req.status_code == 200:
             history = deepcopy(json.loads(req.text)["html"])
@@ -897,20 +881,20 @@ class HTBot():
                         for rating in diff_ratings:
                             score += (rating * _count)
                             _count += 1
-                        real_difficulty = "🛡️ {}/10".format(round(score / sum(diff_ratings), 1))
+                        real_difficulty = "\t🛡️ {}/10".format(round(score / sum(diff_ratings), 1))
                     else:
-                        real_difficulty = "🛡️ -"
+                        real_difficulty = "\t🛡️ -"
                     # OS emoji
                     if box["os"].lower() == "windows":
-                        emoji = cfg.emojis["windows"] + " "
+                        emoji = "\t" + cfg.emojis["windows"] + " "
                     elif box["os"].lower() == "linux":
-                        emoji = cfg.emojis["linux"] + " "
+                        emoji = "\t" + cfg.emojis["linux"] + " "
                     else:
                         emoji = ""
-                    difficulty[type]["output"] = "{}{}. {}**{}** (⭐ {}) ({})\n".format(difficulty[type]["output"], count, emoji, box["name"], box["rating"], real_difficulty)
+                    difficulty[type]["output"] = "\t{}{}. {}**{}** (⭐ {}) ({})\n".format(difficulty[type]["output"], count, emoji, box["name"], box["rating"], real_difficulty)
 
             else:
-                difficulty[type]["output"] = "*Empty*"
+                difficulty[type]["output"] = "\t*Empty*"
 
             if remaining:
                 embed = discord.Embed(color=0x9acc14, title="Active boxes 💻 | {}".format(type.capitalize()), description="**Remaining for {}**".format(username))
@@ -938,20 +922,20 @@ class HTBot():
                             for rating in diff_ratings:
                                 score += (rating * _count)
                                 _count += 1
-                            real_difficulty = "🛡️ {}/10".format(round(score / sum(diff_ratings), 1))
+                            real_difficulty = "\t🛡️ {}/10".format(round(score / sum(diff_ratings), 1))
                         else:
-                            real_difficulty = "🛡️ -"
+                            real_difficulty = "\t🛡️ -"
                         # OS emoji
                         if box["os"].lower() == "windows":
-                            emoji = cfg.emojis["windows"] + " • "
+                            emoji = cfg.emojis["windows"] + "\t • "
                         elif box["os"].lower() == "linux":
-                            emoji = cfg.emojis["linux"] + " • "
+                            emoji = cfg.emojis["linux"] + "\t • "
                         else:
-                            emoji = ""
-                        difficulty[diff]["output"] = "{}{}. {}**{}** (⭐ {}) ({})\n".format(difficulty[diff]["output"], count, emoji, box["name"], box["rating"], real_difficulty)
+                            emoji = "\t"
+                        difficulty[diff]["output"] = "\t{}{}. {}**{}** (⭐ {}) ({})\n".format(difficulty[diff]["output"], count, emoji, box["name"], box["rating"], real_difficulty)
 
                 else:
-                    difficulty[diff]["output"] = "*Empty*"
+                    difficulty[diff]["output"] = "\t*Empty*"
 
                 embed.add_field(name=diff.capitalize(), value=difficulty[diff]["output"], inline=False)
 
@@ -977,11 +961,12 @@ class HTBot():
         challs = self.challs
 
         for chall in challs:
-            if chall["name"].lower() == chall_name.lower():
-                if chall["status"].lower() == "active":
-                    return "active"
-                else:
-                    return "retired"
+            if isinstance(chall["name"],str):
+                if chall["name"].lower() == chall_name.lower():
+                    if chall["status"]:
+                        return "active"
+                    else:
+                        return "retired"
 
         return False
 
@@ -1011,56 +996,33 @@ class HTBot():
         for box in boxs:
             if box["name"].lower() == box_name.lower():
                 if links:
-                    req = await self.session.get("https://www.hackthebox.eu/home/machines/profile/" + str(box["id"]), headers=self.headers)
+                    response = self.api_v4.machine_walkthroughs(box["id"])
+                    if response is False:
+                        return {"status": "empty"}
 
-                    if req.status_code == 200:
-                        body = req.text
-                        html = Selector(text=body)
+                    text = ""
+                    nb_writeup = 0
+                    max_writeup = 20
+                    for writeup in response['message']['writeups']:
+                        if nb_writeup > max_writeup:
+                            break
+                        text += "**Auteur : {}**\n**Lien :** {}\n\n".format(writeup['user_name'], writeup['url'])
+                        nb_writeup += 1
 
-                        wpsection = html.css('div.panel.panel-filled').getall()[-1]
-                        result = re.compile(regexs["writeup_links"]).findall(wpsection)
+                    embed = discord.Embed(title="📚 Writeups submitted | {}".format(box["name"].capitalize()), color=0x9acc14, description=text)
 
-                        #If there are writeup links
-                        if result and len(result[0]) == 2:
-                            nb = len(result)
-                            limit = 5 # Pagination
-                            if nb/limit - nb//limit == 0.0:
-                                total = nb//limit
-                            else:
-                                total = nb//limit + 1
-                            if page > total:
-                                return {"status": "too_high"}
-
-                            else:
-                                writeups = result[(limit*page-limit):(limit*page)]
-
-                                text = ""
-                                for wp in writeups:
-                                    text += "**Auteur : {}**\n**Lien :** {}\n\n".format(wp[0], wp[1])
-
-                                embed = discord.Embed(title="📚 Writeups submitted | {}".format(box["name"].capitalize()), color=0x9acc14, description=text)
-                                embed.set_footer(text="📖 Page : {} / {}".format(page, total))
-
-                                return {"status" : "found", "embed": embed}
-
-                        else:
-                            return {"status": "empty"}
-
-                    return False
-
+                    return {"status" : "found", "embed": embed}
                 else:
-                    req = await self.session.get("https://www.hackthebox.eu/home/machines/writeup/" + str(box["id"]), headers=self.headers)
+                    response = self.api_v4.machine_writeup(box["id"])
+                    if response is False:
+                        return False
 
-                    if req.status_code == 200:
-                        pathname = 'resources/writeups/' + box["name"].lower() + '.pdf'
-                        if not path.exists(pathname):
-                            open(pathname, 'wb').write(req.content)
+                    pathname = 'resources/writeups/' + box["name"].lower() + '.pdf'
+                    if not path.exists(pathname):
+                        open(pathname, 'wb').write(response.content)
 
-                        file = discord.File(pathname, filename=box["name"].lower() + '.pdf')
-                        return file
-
-                    return False
-
+                    file = discord.File(pathname, filename=box["name"].lower() + '.pdf')
+                    return file
 
     def ippsec(self, search, page):
         db = self.ippsec_db
@@ -1106,7 +1068,7 @@ class HTBot():
 
     async def check_if_host_is_vip(self):
         print("Détection du VIP...")
-        req = await self.session.post("https://www.hackthebox.eu/api/subscriptions/snippet", params=self.payload, headers=self.headers)
+        req = await self.session.post(self.api_url_v3 + "/subscriptions/snippet", params=self.payload, headers=self.headers)
         if req.status_code == 200:
             body = req.text
             status = re.compile(self.regexs["check_vip"]).findall(body)
@@ -1327,7 +1289,7 @@ class HTBot():
 
     def list_challs(self, category="", type=False, remaining=False, discord_id=None):
 
-        categories = ["reversing", "crypto", "stego", "pwn", "web", "misc", "forensics", "mobile", "osint"]
+        categories = self.get_chall_categories(True)
 
         if remaining:
             found_flag = False
@@ -1358,7 +1320,7 @@ class HTBot():
             }
 
             for chall in challs:
-                if chall["status"].lower() == "active" and chall["category"].lower() == category:
+                if chall["status"] and chall["category"].lower() == category:
                     if chall["difficulty"].lower() == "easy":
                         difficulty["easy"]["challs"].append(chall)
                     elif chall["difficulty"].lower() == "medium":
@@ -1480,7 +1442,9 @@ class HTBot():
                     if _user["discord_id"] == discord_id:
                         user = _user
 
-            categories_stats = {categories[i]: {"count": 0, "points": 0, "diff": 0, "rating": 0, "retired": 0} for i in range(len(categories))}
+            categories_stats = {}
+            for category in categories:
+                categories_stats[category.lower()] = {"count": 0, "points": 0, "diff": 0, "rating": 0, "retired": 0}
 
             for chall in challs:
                 if remaining:
@@ -1496,7 +1460,7 @@ class HTBot():
                     if chall["difficulty"].lower() != type:
                         continue
 
-                if chall["status"].lower() == "active":
+                if chall["status"]:
                     categories_stats[chall["category"].lower()]["count"] += 1
                     categories_stats[chall["category"].lower()]["points"] += chall["points"]
                     if (chall["rates"]["pro"] - chall["rates"]["sucks"]) >= 0 :
