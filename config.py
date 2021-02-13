@@ -1,6 +1,9 @@
 HTB = {
     "email": "email@example.com",
     "password": "password",
+    "htb_url": "https://www.hackthebox.eu",
+    "api_url_v3": "https://www.hackthebox.eu/api",
+    "api_url": "https://www.hackthebox.eu/api/v4",
     "api_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 
@@ -24,7 +27,8 @@ roles = {
 options = {
     "writeup_legit": True
 }
+
 emojis = {
-    "windows": "<:windows:649003886828322827>",
-    "linux": "<:linux:649003931590066176>"
+    "linux": "🐧",
+    "windows": "🪟",
 }
