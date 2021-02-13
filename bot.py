@@ -3,15 +3,18 @@ from discord.ext import tasks, commands
 from lib.htb import HTBot
 import config as cfg
 from trio import run as trio_run
+from trio import lowlevel as trio_lowlevel
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import functools
-import pdb
+
+intents = discord.Intents.default()
+intents.members = True
 
 description = """HideAndSec's slave bot"""
-bot = commands.Bot(command_prefix='>', description=description)
+bot = commands.Bot(intents=intents, command_prefix='>', description=description)
 
-htbot = HTBot(cfg.HTB['email'], cfg.HTB['password'], cfg.HTB['api_token'])
+htbot = HTBot()
 
 THREADS = {
     "refresh_users": ThreadPoolExecutor(max_workers=1),
@@ -35,9 +38,10 @@ async def on_ready():
     print(bot.user.name)
     print(bot.user.id)
     print('------')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=">help"))
+    bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=">help"))
     try:
         bot.add_cog(tasksCog(bot))
+        await asyncio.sleep(300)
     except:
         pass
 
@@ -45,6 +49,34 @@ async def on_ready():
         print("Le bot est lancé en mode writeup legit !")
 
 #Tasks
+
+# https://trio.readthedocs.io/en/stable/reference-lowlevel.html?highlight=host_uses_signal_set_wakeup_fd#implementing-guest-mode-for-your-favorite-event-loop
+
+def trio_run_with_asyncio(trio_main):
+    async def asyncio_main():
+        asyncio_loop = asyncio.get_running_loop()
+        def run_sync_soon_threadsafe(fn):
+            asyncio_loop.call_soon_threadsafe(fn)
+
+        # Revised 'done' callback: set a Future
+        done_fut = asyncio.Future()
+        def done_callback(trio_main_outcome):
+            done_fut.set_result(trio_main_outcome)
+
+        trio_lowlevel.start_guest_run(
+            trio_main,
+            run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+            done_callback=done_callback,
+            run_sync_soon_not_threadsafe=None,
+            host_uses_signal_set_wakeup_fd=True
+        )
+
+        # Wait for the guest run to finish
+        trio_main_outcome = await done_fut
+        # Pass through the return value or exception from the guest run
+        return trio_main_outcome.unwrap()
+    return asyncio_main()
+
 
 class tasksCog(commands.Cog):
     def __init__(self, bot):
@@ -59,7 +91,7 @@ class tasksCog(commands.Cog):
         self.manage_channels.start()
         self.refresh_shoutbox.start()
 
-    @tasks.loop(seconds=3.0) #Toutes les 3 secondes, check les notifications
+    @tasks.loop(seconds=10.0) #Toutes les 10 secondes, check les notifications
     async def check_notif(self):
         notif = htbot.notif
         if notif["update_role"]["state"]:
@@ -73,12 +105,13 @@ class tasksCog(commands.Cog):
             guilds = bot.guilds
             for guild in guilds:
                 if guild.name == cfg.discord['guild_name']:
+                    guild.fetch_members(limit=None)
                     member = guild.get_member(content["discord_id"])
             await shoutbox.send("👋 Bienvenue {} ! Heureux de t'avoir parmis nous.\nTu es arrivé avec le rang {} !".format(member.mention, content["level"]))
             embed = await thread_get_user(content["htb_id"])
             msg = await shoutbox.send(embed=embed)
             await msg.add_reaction("👋")
-            htbot.notif["new_role"]["state"] = False
+            htbot.notif["new_user"]["state"] = False
 
         elif notif["box_pwn"]["state"]:
             content = notif["box_pwn"]["content"]
@@ -131,11 +164,11 @@ class tasksCog(commands.Cog):
     async def refresh_shoutbox(self):
         LOOP.run_in_executor(THREADS["shoutbox"], trio_run, htbot.shoutbox)
 
-    @tasks.loop(seconds=1800.0) #Toutes les 30 minutes
+    @tasks.loop(seconds=600.0) #Toutes les 10 minutes
     async def htb_login(self):
         trio_run(htbot.login)
 
-    @tasks.loop(seconds=1800.0) #Toutes les 10 minutes
+    @tasks.loop(seconds=1800.0) #Toutes les 30 minutes
     async def check_host_vip(self):
         trio_run(htbot.check_if_host_is_vip)
 
@@ -306,7 +339,7 @@ async def last_box(ctx, param=""):
         if param.lower() == "-m" or param.lower() == "--matrix":
             box = await thread_get_box(matrix=True, last=True)
         else:
-            await ctx.send("Paramètres incorrectes.")
+            await ctx.send("Paramètres incorrects.")
             return False
     else:
         box = await thread_get_box(last=True)
@@ -400,7 +433,7 @@ async def get_shoutbox_channel():
         if guild.name == cfg.discord['guild_name']:
             channels = guild.channels
             for channel in channels:
-                if channel.name == "shoutbox":
+                if channel.name == cfg.discord['shoutbox_channel']:
                     return channel
 
 @bot.command()
@@ -554,7 +587,7 @@ async def work_on(ctx, *, content=""):
             count += 1
 
     if (box and chall) or (not box and not chall):
-        await ctx.send("Erreur.")
+        await ctx.send(">man work_on")
         return False
 
     target = " ".join(query)
@@ -665,7 +698,7 @@ async def work_on(ctx, *, content=""):
 
 @bot.command()
 async def account(ctx, arg, action=""):
-    """Manage your HTB account on the Discord server"""
+    """!! Not implemented yet !! Manage your HTB account """
 
 @bot.command()
 async def writeup(ctx, *, content=""):
@@ -825,6 +858,10 @@ async def ippsec(ctx, *, content=""):
             count += 1
 
     query = " ".join(query)
+    if not query:
+        await ctx.send("Aucune machine spécifié ! **>man ippsec**")
+        return
+
     await search(ctx, query, page=page)
 
 @bot.command()
@@ -938,7 +975,7 @@ async def progress(ctx, *, content=""):
             count += 1
 
     if (box and chall) or (not box and not chall):
-        await ctx.send("Erreur.")
+        await ctx.send("Aucune box ou challenge !!! **>man progress**")
         return False
 
     target = " ".join(query)
@@ -1008,13 +1045,13 @@ async def man(ctx, command=""):
         {command} | *la commande sur laquelle tu veux avoir des informations*
 
         **EXAMPLES**
-        >man account
+        >man work_on
         >man get_box
         """)
 
     elif command == "account":
         embed = discord.Embed(color=0x9acc14, title="📖  >account", description="""
-        ***gère la synchronisation Hack The Box***
+        ***gère la synchronisation Hack The Box (pas encore implémenté)>help***
 
         **PARAMS**
         -mention on/off | *si le bot te mentionne dans la shoutbox ou non*
@@ -1040,6 +1077,17 @@ async def man(ctx, command=""):
         **EXAMPLES**
         >get_box forest
         >get_box registry -matrix
+        """)
+
+    elif command == "get_chall":
+        embed = discord.Embed(color=0x9acc14, title="📖  >get_chall", description="""
+        ***récupère les informations sur un challenge***
+
+        **ARGS**
+        {chall_name} | *le nom du challenge*
+
+        **EXAMPLES**
+        >get_chall forest
         """)
 
     elif command == "last_box":
@@ -1152,9 +1200,31 @@ async def man(ctx, command=""):
         **ARGS**
         {box_name} | *le nom de la box*
 
+        **PARAMS**
+        -b ou --box | *indique que vous travaillez sur une box*
+        -c ou --chall | *indique que vous travaillez sur un challenge*
+
         **EXAMPLES**
         >work_on
-        >work_on monteverde
+        >work_on --box monteverde
+        >work_on --chall headache
+        """)
+
+    elif command == "progress":
+        embed = discord.Embed(color=0x9acc14, title="📖  >progress", description="""
+        ***Avoir la progression des membres sur une box ou un challenge***
+
+        **ARGS**
+        {box_name} | *le nom de la box*
+
+        **PARAMS**
+        -b ou --box | *la box*
+        -c ou --chall | *le challenge*
+
+        **EXAMPLES**
+        >progress
+        >progress --box monteverde
+        >progress --chall headache
         """)
 
     elif command == "ippsec":
