@@ -7,7 +7,6 @@ import json
 from time import localtime, gmtime, strftime, sleep
 import discord
 from copy import deepcopy
-from scrapy.selector import Selector
 import config as cfg
 import resources.charts as charts
 import urllib
